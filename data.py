@@ -114,7 +114,6 @@ def _npz_payload_from_mol(m: "MoleculeData") -> dict:
     if m.pos is not None:             payload["pos"] = _to_np(m.pos)
     if m.edge_index is not None:      payload["edge_index"] = _to_np(m.edge_index)  # (2, E)
     if m.edge_type is not None:       payload["edge_type"] = _to_np(m.edge_type)
-    if m.u0 is not None:              payload["u0"] = _to_np(m.u0)
 
     return payload
 

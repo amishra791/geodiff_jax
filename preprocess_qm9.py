@@ -101,7 +101,6 @@ def split_list(items, train_frac=0.8, seed=0):
     return train_items, val_items, test_items
 
 
-
 def preprocess_GEOM_dataset(base_path, pickle_paths, conf_per_mol=5):
     samples = []  # list of (MoleculeData, smiles)
     bad_case = 0
