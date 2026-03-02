@@ -22,7 +22,7 @@ from data import MoleculeData, BONDS, save_molecules_split
 # Scripts adapted from https://github.com/DeepGraphLearning/ConfGF/blob/main/confgf/dataset/dataset.py
 # For a primer on how to interpret GEOM data, see this example notebook: https://github.com/learningmatter-mit/geom/blob/master/tutorials/02_loading_rdkit_mols.ipynb
 
-def rdmol_to_data(mol:Mol, global_features, smiles=None):
+def rdmol_to_data(mol:Mol, smiles=None):
     assert mol.GetNumConformers() == 1
     N = mol.GetNumAtoms()
 
@@ -63,14 +63,13 @@ def rdmol_to_data(mol:Mol, global_features, smiles=None):
     row, col = edge_index
     hs = (z == 1).astype(jnp.float32)
     num_hs = scatter(hs[row], col, dim_size=N, reduce='add').tolist()
-
+    
     data = MoleculeData(
         atom_type=z, 
         pos=pos, 
         edge_index=edge_index, 
-        edge_type=edge_type, 
-        totalenergy=jnp.array(global_features['totalenergy']).astype(jnp.float32),
-        boltzmannweight=jnp.array(global_features['boltzmannweight']).astype(jnp.float32))
+        edge_type=edge_type,
+    )
 
     return data
 
@@ -133,12 +132,8 @@ def preprocess_GEOM_dataset(base_path, pickle_paths, conf_per_mol=5):
 
         for conf_id in conf_ids:
             conf_meta = conformers[conf_id]
-            global_features = {
-                "totalenergy": conf_meta["totalenergy"],
-                "boltzmannweight": conf_meta["boltzmannweight"],
-            }
             rdmol = conf_meta["rd_mol"]
-            data = rdmol_to_data(rdmol, global_features)
+            data = rdmol_to_data(rdmol)
             molblock = Chem.MolToMolBlock(rdmol, confId=0)
             samples.append((data, smiles, molblock))
 

@@ -7,27 +7,88 @@ import numpy as np
 from jraphx import Data
 import jax.numpy as jnp
 from flax.struct import dataclass
+from jax.typing import ArrayLike
+import jax.tree as jt
+import jax.random as jr
 
 from rdkit.Chem.rdchem import BondType
 
 # Constants used throughout data prep and modelling
+
+# Least power of 2 >= number of elements in the periodic table for TPU friendliness.
+# Overkill our purposes, but a nice catch-all value.
+NUM_ELEMENTS = 128
 
 # we use 0 since atomic numbers are 1-indexed
 ATOMIC_NUMBER_PAD_VAL = 0
 # unspecified is used for padding
 BONDS = {BondType.UNSPECIFIED: 0, BondType.SINGLE: 1, BondType.DOUBLE: 2, BondType.TRIPLE: 3, BondType.AROMATIC: 4}
 
+# max number of atoms in the QM9 dataset. this was empirically determined
+N_MAX = 29
+# use an upper-bound of a complete graph to pad the number of edges
+E_MAX = N_MAX * (N_MAX - 1)
+
 
 @dataclass
-class MoleculeData(Data):
+class MoleculeData:
     """Data class for RDKit molecules."""
-    atom_type: Optional[jnp.ndarray] = None           # Atom type [num_atoms,]
-    edge_type: Optional[jnp.ndarray] = None           # Edge type [num_edges,]
-    totalenergy: Optional[jnp.ndarray] = None         # the absolute energy of this conformer, in Hartree. scalar
-    boltzmannweight: Optional[jnp.ndarray] = None     # statistical weight of this conformer. scalar
+    atom_type: Optional[ArrayLike] = None           # Atom type [num_atoms,]
+    pos: Optional[ArrayLike] = None                 # Pos [num_atoms, 3]
+    edge_index: Optional[ArrayLike] = None          # edge index [2, num_edges]
+    edge_type: Optional[ArrayLike] = None           # Edge type [num_edges,]
 
-    node_mask: Optional[jnp.ndarray] = None   # [N_max,] bool
-    edge_mask: Optional[jnp.ndarray] = None   # [E_max,] bool
+    node_mask: Optional[ArrayLike] = None   # [N_max,] bool
+    edge_mask: Optional[ArrayLike] = None   # [E_max,] bool
+
+def pad_molecule(mol_data: MoleculeData) -> MoleculeData: 
+    num_atoms = mol_data.pos.shape[0]
+    num_edges = mol_data.edge_index.shape[1]
+
+    num_pad_nodes = N_MAX - num_atoms
+    atom_type = np.concatenate([mol_data.atom_type, np.full(num_pad_nodes, ATOMIC_NUMBER_PAD_VAL)])
+    pos = np.concatenate([mol_data.pos, np.full((num_pad_nodes, 3), 0)], axis=0)
+    assert atom_type.shape == (N_MAX,)
+    assert pos.shape == (N_MAX, 3)
+
+    num_pad_edges = E_MAX - num_edges
+    edge_index = np.concatenate([mol_data.edge_index, np.full((2, num_pad_edges), 0)], axis=1)
+    edge_type = np.concatenate([mol_data.edge_type, np.full(num_pad_edges, BONDS[BondType.UNSPECIFIED])])
+    assert edge_index.shape == (2, E_MAX)
+    assert edge_type.shape == (E_MAX,)
+    
+    node_mask = np.where(np.arange(N_MAX) < num_atoms, True, False)
+    edge_mask = np.where(np.arange(E_MAX) < num_edges, True, False)
+    assert node_mask.shape == (N_MAX,)
+    assert edge_mask.shape == (E_MAX,)
+
+    return mol_data.replace(
+        atom_type=atom_type,
+        pos=pos,
+        edge_index=edge_index, 
+        edge_type=edge_type,
+        node_mask=node_mask, 
+        edge_mask=edge_mask
+    )
+
+def sample_from_list(rngs, data_list, n):
+    N = len(data_list)
+    idx = jr.choice(rngs(), N, shape=(n,), replace=False)
+    idx = list(map(int, idx))  # convert to Python ints
+    return [data_list[i] for i in idx]
+
+def collate_molecules_allow_none(examples: List[MoleculeData]) -> MoleculeData:
+    def stack_or_none(*xs):
+        if xs[0] is None:
+            return None
+        return np.stack(xs, axis=0)
+    return jt.map(stack_or_none, *examples)
+
+def to_jax(mol: MoleculeData) -> MoleculeData:
+    return jt.map(
+        lambda x: None if x is None else jnp.asarray(x),
+        mol
+    )
 
 def _to_np(a):
     """Convert JAX/NumPy arrays to NumPy arrays; pass through python scalars."""
@@ -48,24 +109,16 @@ def _npz_payload_from_mol(m: "MoleculeData") -> dict:
     """
     payload = {}
 
-    # Base Data fields
-    if m.x is not None:         payload["x"] = _to_np(m.x)
-    if m.edge_index is not None:payload["edge_index"] = _to_np(m.edge_index)  # (2, E)
-    if m.edge_attr is not None: payload["edge_attr"] = _to_np(m.edge_attr)
-    if m.y is not None:         payload["y"] = _to_np(m.y)
-    if m.pos is not None:       payload["pos"] = _to_np(m.pos)
-    if m.batch is not None:     payload["batch"] = _to_np(m.batch)
-    if m.ptr is not None:       payload["ptr"] = _to_np(m.ptr)
-
     # MoleculeData fields
     if m.atom_type is not None:       payload["atom_type"] = _to_np(m.atom_type)
+    if m.pos is not None:             payload["pos"] = _to_np(m.pos)
+    if m.edge_index is not None:      payload["edge_index"] = _to_np(m.edge_index)  # (2, E)
     if m.edge_type is not None:       payload["edge_type"] = _to_np(m.edge_type)
-    if m.totalenergy is not None:     payload["totalenergy"] = _to_np(m.totalenergy)
-    if m.boltzmannweight is not None: payload["boltzmannweight"] = _to_np(m.boltzmannweight)
+    if m.u0 is not None:              payload["u0"] = _to_np(m.u0)
 
     return payload
 
-def _get_arr(arrs: np.lib.npyio.NpzFile, key: str):
+def _get_np_arr(arrs: np.lib.npyio.NpzFile, key: str):
     """Return jnp.array(...) if key exists, else None."""
     if key not in arrs:
         return None
@@ -129,25 +182,21 @@ def load_molecules_split(
     index_obj = json.loads(index_path.read_text())
     records = index_obj["records"]
 
-    if num_mols > index_obj["num_conformers"]:
-        raise ValueError(f"Number of molecules ({num_mols}) is larger than " 
-                         + f"available samples ({index_obj["num_conformers"]})")
-
-    # print(records.keys())
-
     if num_mols is not None:
-        sampled_records = []
+        if num_mols > index_obj["num_conformers"]:
+            raise ValueError(f"Number of molecules ({num_mols}) is larger than " 
+                            + f"available samples ({index_obj["num_conformers"]})")
+
+        sampled_records = {}
         num_samples = 0
         
         for smiles_str in records:
             if num_samples >= num_mols:
                 break
-            sampled_records.extend(records[smiles_str])
+            sampled_records[smiles_str] = records[smiles_str]
             num_samples += len(records[smiles_str])
             
         records = sampled_records
-
-    # print(records[0])
 
     out: List[tuple["MoleculeData", str]] = []
     for rec in tqdm(records, desc=f"Loading split={split_dir.name}"):
@@ -159,20 +208,11 @@ def load_molecules_split(
         arrs = np.load(fpath, allow_pickle=False)
 
         m = MoleculeData(
-            # Base Data
-            x=_get_arr(arrs, "x"),
-            edge_index=_get_arr(arrs, "edge_index"),
-            edge_attr=_get_arr(arrs, "edge_attr"),
-            y=_get_arr(arrs, "y"),
-            pos=_get_arr(arrs, "pos"),
-            batch=_get_arr(arrs, "batch"),
-            ptr=_get_arr(arrs, "ptr"),
-
             # MoleculeData
-            atom_type=_get_arr(arrs, "atom_type"),
-            edge_type=_get_arr(arrs, "edge_type"),
-            totalenergy=_get_arr(arrs, "totalenergy"),
-            boltzmannweight=_get_arr(arrs, "boltzmannweight"),
+            atom_type=_get_np_arr(arrs, "atom_type"),
+            pos=_get_np_arr(arrs, "pos"),
+            edge_index=_get_np_arr(arrs, "edge_index"),
+            edge_type=_get_np_arr(arrs, "edge_type"),
         )
         out.append((m, smiles, molblock))
 
